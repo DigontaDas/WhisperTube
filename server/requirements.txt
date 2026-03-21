@@ -1,0 +1,39 @@
+# Core Flask dependencies
+Flask>=3.0.0
+Werkzeug>=3.0.0
+python-dotenv>=1.0.0
+flask-cors>=4.0.0
+
+# AI/ML dependencies
+torch>=2.1.0
+transformers>=4.35.0
+numpy>=1.25.2
+datasets>=2.14.0
+peft>=0.5.0
+
+# Audio processing
+sounddevice>=0.4.7
+faster-whisper>=0.9.1
+ctranslate2>=3.25.1
+
+# Translation and language detection
+langdetect>=1.0.9
+sentencepiece>=0.1.99
+
+# Video/audio downloading
+yt-dlp>=2023.11.16
+
+# PDF processing
+PyPDF2>=3.0.0
+pdfplumber>=0.10.0
+
+# Additional utilities
+requests>=2.31.0
+
+# Development and testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-flask>=1.2.0
+black>=23.0.0
+flake8>=6.0.0
+pylint>=2.17.0
