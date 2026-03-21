@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import tempfile
+import shutil
 
 logger = logging.getLogger(__name__)
 api_bp = Blueprint('api', __name__, url_prefix='/api')
@@ -22,13 +23,31 @@ def extract_video_id(url):
 
 
 def get_youtube_transcript(video_id):
-    """Try youtube-transcript-api - works with both old and new API versions."""
+    """Try youtube-transcript-api - compatible with all versions."""
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
 
-        transcript_data = None
+        # Try get_transcript (works in most versions)
+        if hasattr(YouTubeTranscriptApi, 'get_transcript'):
+            try:
+                data = YouTubeTranscriptApi.get_transcript(
+                    video_id, languages=['en', 'en-US', 'en-GB']
+                )
+                text = ' '.join(item.get('text', '') for item in data)
+                if text.strip():
+                    logger.info(f"get_transcript success for {video_id}")
+                    return text.strip()
+            except Exception as e1:
+                logger.warning(f"get_transcript en failed: {e1}")
+                try:
+                    data = YouTubeTranscriptApi.get_transcript(video_id)
+                    text = ' '.join(item.get('text', '') for item in data)
+                    if text.strip():
+                        return text.strip()
+                except Exception as e2:
+                    logger.warning(f"get_transcript any failed: {e2}")
 
-        # New API (0.7+): list_transcripts
+        # Try list_transcripts (newer versions)
         if hasattr(YouTubeTranscriptApi, 'list_transcripts'):
             try:
                 transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
@@ -53,45 +72,17 @@ def get_youtube_transcript(video_id):
                 if transcript:
                     fetched = transcript.fetch()
                     if hasattr(fetched, 'snippets'):
-                        transcript_data = [
-                            {'text': s.text} for s in fetched.snippets
-                        ]
+                        text = ' '.join(s.text for s in fetched.snippets)
                     else:
-                        transcript_data = list(fetched)
+                        text = ' '.join(
+                            item.get('text', '') if isinstance(item, dict)
+                            else str(item) for item in fetched
+                        )
+                    if text.strip():
+                        logger.info(f"list_transcripts success for {video_id}")
+                        return text.strip()
             except Exception as e:
                 logger.warning(f"list_transcripts failed: {e}")
-
-        # Old API (0.6.x): get_transcript
-        if not transcript_data and hasattr(YouTubeTranscriptApi, 'get_transcript'):
-            try:
-                transcript_data = YouTubeTranscriptApi.get_transcript(
-                    video_id, languages=['en', 'en-US', 'en-GB']
-                )
-            except Exception:
-                try:
-                    transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
-                except Exception as e:
-                    logger.warning(f"get_transcript failed: {e}")
-
-        # Even older API: fetch
-        if not transcript_data:
-            try:
-                fetched = YouTubeTranscriptApi.fetch(video_id)
-                if hasattr(fetched, 'snippets'):
-                    transcript_data = [{'text': s.text} for s in fetched.snippets]
-                else:
-                    transcript_data = list(fetched)
-            except Exception as e:
-                logger.warning(f"fetch failed: {e}")
-
-        if transcript_data:
-            text = ' '.join(
-                item.get('text', '') if isinstance(item, dict) else str(item)
-                for item in transcript_data
-            )
-            if text.strip():
-                logger.info(f"Transcript success for {video_id}")
-                return text.strip()
 
         return None
 
@@ -100,8 +91,26 @@ def get_youtube_transcript(video_id):
         return None
 
 
+def get_cookies_path():
+    """Copy read-only secrets file to writable temp location if needed."""
+    secrets_path = '/etc/secrets/cookies.txt'
+    if not os.path.exists(secrets_path):
+        return None
+    try:
+        # /etc/secrets is read-only on Render — copy to /tmp
+        tmp_cookies = '/tmp/yt_cookies.txt'
+        shutil.copy2(secrets_path, tmp_cookies)
+        os.chmod(tmp_cookies, 0o644)
+        logger.info(f"Cookies copied to {tmp_cookies}")
+        return tmp_cookies
+    except Exception as e:
+        logger.warning(f"Could not copy cookies: {e}")
+        # Try using directly
+        return secrets_path
+
+
 def transcribe_with_groq(url):
-    """Download audio with yt-dlp + cookies and transcribe with Groq."""
+    """Download audio with yt-dlp and transcribe with Groq."""
     try:
         import yt_dlp
         from groq import Groq
@@ -112,15 +121,12 @@ def transcribe_with_groq(url):
             return None, None
 
         client = Groq(api_key=groq_key)
-
-        # Check if cookies file exists (uploaded to Render)
-        cookies_file = os.environ.get('YOUTUBE_COOKIES_FILE', '/etc/secrets/cookies.txt')
-        cookies_exist = os.path.exists(cookies_file)
-        logger.info(f"Cookies file exists: {cookies_exist} at {cookies_file}")
+        cookies_path = get_cookies_path()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             ydl_opts = {
-                'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                # More flexible format selection
+                'format': 'bestaudio/best',
                 'outtmpl': os.path.join(tmpdir, 'audio.%(ext)s'),
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
@@ -129,12 +135,12 @@ def transcribe_with_groq(url):
                 }],
                 'quiet': True,
                 'no_warnings': True,
+                'extract_flat': False,
             }
 
-            # Add cookies if available
-            if cookies_exist:
-                ydl_opts['cookiefile'] = cookies_file
-                logger.info("Using cookies for yt-dlp")
+            if cookies_path:
+                ydl_opts['cookiefile'] = cookies_path
+                logger.info(f"Using cookies: {cookies_path}")
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -142,7 +148,7 @@ def transcribe_with_groq(url):
 
             audio_file = None
             for f in os.listdir(tmpdir):
-                if f.endswith(('.mp3', '.m4a', '.webm', '.opus')):
+                if f.endswith(('.mp3', '.m4a', '.webm', '.opus', '.ogg')):
                     audio_file = os.path.join(tmpdir, f)
                     break
 
@@ -150,13 +156,14 @@ def transcribe_with_groq(url):
                 logger.error("No audio file found")
                 return None, title
 
+            logger.info(f"Sending to Groq: {os.path.basename(audio_file)}")
             with open(audio_file, 'rb') as f:
                 transcription = client.audio.transcriptions.create(
                     file=(os.path.basename(audio_file), f.read()),
                     model='whisper-large-v3',
                     response_format='text'
                 )
-            logger.info(f"Groq transcription done: {title}")
+            logger.info(f"Groq done: {title}")
             return str(transcription), title
 
     except Exception as e:
@@ -185,7 +192,7 @@ def transcribe():
         if not video_id:
             return jsonify({'error': 'Invalid YouTube URL'}), 400
 
-        # Try transcript API first
+        # Method 1: transcript API (fast, no download)
         transcript = get_youtube_transcript(video_id)
         if transcript and len(transcript) > 20:
             return jsonify({
@@ -194,7 +201,7 @@ def transcribe():
                 'method': 'transcript_api'
             })
 
-        # Fall back to yt-dlp + Groq
+        # Method 2: yt-dlp + Groq
         logger.info(f"Falling back to Groq for {video_id}")
         transcript, title = transcribe_with_groq(url)
         if transcript:
@@ -205,8 +212,8 @@ def transcribe():
             })
 
         return jsonify({
-            'error': 'Could not transcribe. Video has no captions and audio download was blocked. '
-                     'Try a video with auto-generated captions.'
+            'error': 'Could not transcribe this video. '
+                     'Try a video with auto-generated captions enabled.'
         }), 422
 
     except Exception as e:
