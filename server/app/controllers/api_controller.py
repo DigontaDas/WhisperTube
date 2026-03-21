@@ -24,58 +24,61 @@ def extract_video_id(url):
 
 def get_youtube_transcript(video_id):
     """
-    Works with youtube-transcript-api 0.7+ which has fetch() and list() methods.
-    In 0.7+: YouTubeTranscriptApi.fetch(video_id) requires a FetchedTranscript request object.
-    The correct way is: YouTubeTranscriptApi.list(video_id) then .fetch() on a transcript.
+    youtube-transcript-api 1.x (latest):
+    MUST use instance: ytt_api = YouTubeTranscriptApi()
+    then ytt_api.fetch(video_id) or ytt_api.list(video_id)
     """
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
 
-        # 0.7+ API: list(video_id) returns available transcripts
-        transcript_list = YouTubeTranscriptApi.list(video_id)
-        
-        transcript = None
-        # Try English first
+        ytt_api = YouTubeTranscriptApi()
+
+        # Simple fetch — tries English by default
         try:
-            transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB'])
-        except Exception:
-            pass
-        
-        # Try generated English
-        if not transcript:
-            try:
-                transcript = transcript_list.find_generated_transcript(['en', 'en-US'])
-            except Exception:
-                pass
-        
-        # Any available transcript
-        if not transcript:
-            for t in transcript_list:
-                transcript = t
-                logger.info(f"Using transcript: lang={t.language_code} generated={t.is_generated}")
-                break
-
-        if transcript:
-            fetched = transcript.fetch()
-            # 0.7+ FetchedTranscript has .snippets
-            if hasattr(fetched, 'snippets'):
-                text = ' '.join(s.text for s in fetched.snippets)
-            else:
-                # fallback: treat as list of dicts
-                text = ' '.join(
-                    item.get('text', '') if isinstance(item, dict)
-                    else getattr(item, 'text', str(item))
-                    for item in fetched
-                )
+            fetched = ytt_api.fetch(video_id)
+            text = ' '.join(s.text for s in fetched.snippets)
             if text.strip():
-                logger.info(f"Transcript success for {video_id}, chars={len(text)}")
+                logger.info(f"fetch() success for {video_id}, chars={len(text)}")
                 return text.strip()
+        except Exception as e:
+            logger.warning(f"fetch() failed: {e}")
 
-        logger.warning(f"No transcript found for {video_id}")
+        # Try fetch with explicit languages
+        try:
+            fetched = ytt_api.fetch(video_id, languages=['en', 'en-US', 'en-GB'])
+            text = ' '.join(s.text for s in fetched.snippets)
+            if text.strip():
+                logger.info(f"fetch(en) success for {video_id}")
+                return text.strip()
+        except Exception as e:
+            logger.warning(f"fetch(en) failed: {e}")
+
+        # Try list then fetch first available
+        try:
+            transcript_list = ytt_api.list(video_id)
+            for t in transcript_list:
+                try:
+                    fetched = t.fetch()
+                    if hasattr(fetched, 'snippets'):
+                        text = ' '.join(s.text for s in fetched.snippets)
+                    else:
+                        text = ' '.join(
+                            item.get('text', '') if isinstance(item, dict)
+                            else getattr(item, 'text', str(item))
+                            for item in fetched
+                        )
+                    if text.strip():
+                        logger.info(f"list+fetch success lang={t.language_code}")
+                        return text.strip()
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"list() failed: {e}")
+
         return None
 
     except Exception as e:
-        logger.warning(f"Transcript API failed for {video_id}: {e}")
+        logger.error(f"Transcript API error: {e}")
         return None
 
 
@@ -154,15 +157,12 @@ def health():
     try:
         import youtube_transcript_api as yta
         ver = getattr(yta, '__version__', 'unknown')
-        methods = [m for m in dir(yta.YouTubeTranscriptApi) if not m.startswith('_')]
     except Exception as e:
         ver = str(e)
-        methods = []
     return jsonify({
         'status': 'ok',
         'service': 'WhisperTube',
         'yta_version': ver,
-        'yta_methods': methods,
         'cookies': os.path.exists('/etc/secrets/cookies.txt'),
         'groq': bool(os.environ.get('GROQ_API_KEY'))
     })
@@ -184,7 +184,7 @@ def transcribe():
         if not video_id:
             return jsonify({'error': 'Invalid YouTube URL'}), 400
 
-        # Method 1: transcript API
+        # Method 1: transcript API (instant, no download)
         transcript = get_youtube_transcript(video_id)
         if transcript and len(transcript) > 20:
             return jsonify({'transcript': transcript, 'title': video_id, 'method': 'transcript_api'})
