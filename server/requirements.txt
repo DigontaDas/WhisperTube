@@ -4,5 +4,5 @@ python-dotenv>=1.0.0
 flask-cors>=4.0.0
 yt-dlp>=2025.1.26
 requests>=2.31.0
-youtube-transcript-api==0.6.3
+youtube-transcript-api
 groq>=0.4.0

@@ -24,52 +24,58 @@ def extract_video_id(url):
 
 def get_youtube_transcript(video_id):
     """
-    youtube-transcript-api==0.6.3
-    Correct usage: YouTubeTranscriptApi.get_transcript(video_id)
+    Works with youtube-transcript-api 0.7+ which has fetch() and list() methods.
+    In 0.7+: YouTubeTranscriptApi.fetch(video_id) requires a FetchedTranscript request object.
+    The correct way is: YouTubeTranscriptApi.list(video_id) then .fetch() on a transcript.
     """
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
 
-        # 0.6.3 primary method
+        # 0.7+ API: list(video_id) returns available transcripts
+        transcript_list = YouTubeTranscriptApi.list(video_id)
+        
+        transcript = None
+        # Try English first
         try:
-            data = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-US', 'en-GB'])
-            text = ' '.join(item['text'] for item in data if item.get('text'))
-            if text.strip():
-                logger.info(f"Transcript success (en) for {video_id}, chars={len(text)}")
-                return text.strip()
-        except Exception as e:
-            logger.warning(f"get_transcript en failed: {e}")
-
-        # Try any language
-        try:
-            data = YouTubeTranscriptApi.get_transcript(video_id)
-            text = ' '.join(item['text'] for item in data if item.get('text'))
-            if text.strip():
-                logger.info(f"Transcript success (any) for {video_id}, chars={len(text)}")
-                return text.strip()
-        except Exception as e:
-            logger.warning(f"get_transcript any lang failed: {e}")
-
-        # Try listing all available and picking first
-        try:
-            from youtube_transcript_api import TranscriptList
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB'])
+        except Exception:
+            pass
+        
+        # Try generated English
+        if not transcript:
+            try:
+                transcript = transcript_list.find_generated_transcript(['en', 'en-US'])
+            except Exception:
+                pass
+        
+        # Any available transcript
+        if not transcript:
             for t in transcript_list:
-                try:
-                    data = t.fetch()
-                    text = ' '.join(item['text'] for item in data if item.get('text'))
-                    if text.strip():
-                        logger.info(f"Transcript via list lang={t.language_code}, chars={len(text)}")
-                        return text.strip()
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.warning(f"list_transcripts failed: {e}")
+                transcript = t
+                logger.info(f"Using transcript: lang={t.language_code} generated={t.is_generated}")
+                break
 
+        if transcript:
+            fetched = transcript.fetch()
+            # 0.7+ FetchedTranscript has .snippets
+            if hasattr(fetched, 'snippets'):
+                text = ' '.join(s.text for s in fetched.snippets)
+            else:
+                # fallback: treat as list of dicts
+                text = ' '.join(
+                    item.get('text', '') if isinstance(item, dict)
+                    else getattr(item, 'text', str(item))
+                    for item in fetched
+                )
+            if text.strip():
+                logger.info(f"Transcript success for {video_id}, chars={len(text)}")
+                return text.strip()
+
+        logger.warning(f"No transcript found for {video_id}")
         return None
 
     except Exception as e:
-        logger.error(f"Transcript API error: {e}")
+        logger.warning(f"Transcript API failed for {video_id}: {e}")
         return None
 
 
@@ -146,14 +152,17 @@ def transcribe_with_groq(url):
 @api_bp.route('/health', methods=['GET'])
 def health():
     try:
-        import youtube_transcript_api
-        yta_ver = getattr(youtube_transcript_api, '__version__', 'unknown')
+        import youtube_transcript_api as yta
+        ver = getattr(yta, '__version__', 'unknown')
+        methods = [m for m in dir(yta.YouTubeTranscriptApi) if not m.startswith('_')]
     except Exception as e:
-        yta_ver = f"error: {e}"
+        ver = str(e)
+        methods = []
     return jsonify({
         'status': 'ok',
         'service': 'WhisperTube',
-        'yta_version': yta_ver,
+        'yta_version': ver,
+        'yta_methods': methods,
         'cookies': os.path.exists('/etc/secrets/cookies.txt'),
         'groq': bool(os.environ.get('GROQ_API_KEY'))
     })
