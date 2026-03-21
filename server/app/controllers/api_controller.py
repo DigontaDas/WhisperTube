@@ -22,46 +22,86 @@ def extract_video_id(url):
 
 
 def get_youtube_transcript(video_id):
-    """Try youtube-transcript-api v0.6+ first — fast and free."""
+    """Try youtube-transcript-api - works with both old and new API versions."""
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        transcript = None
-        try:
-            transcript = transcript_list.find_manually_created_transcript(['en', 'en-US', 'en-GB'])
-        except Exception:
-            pass
-        if not transcript:
+
+        transcript_data = None
+
+        # New API (0.7+): list_transcripts
+        if hasattr(YouTubeTranscriptApi, 'list_transcripts'):
             try:
-                transcript = transcript_list.find_generated_transcript(['en', 'en-US'])
-            except Exception:
-                pass
-        if not transcript:
-            for t in transcript_list:
-                transcript = t
-                break
-        if transcript:
-            fetched = transcript.fetch()
-            if hasattr(fetched, 'snippets'):
-                text = ' '.join(s.text for s in fetched.snippets)
-            elif hasattr(fetched, '__iter__'):
-                text = ' '.join(
-                    item.get('text', '') if isinstance(item, dict) else str(item)
-                    for item in fetched
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                transcript = None
+                try:
+                    transcript = transcript_list.find_manually_created_transcript(
+                        ['en', 'en-US', 'en-GB']
+                    )
+                except Exception:
+                    pass
+                if not transcript:
+                    try:
+                        transcript = transcript_list.find_generated_transcript(
+                            ['en', 'en-US']
+                        )
+                    except Exception:
+                        pass
+                if not transcript:
+                    for t in transcript_list:
+                        transcript = t
+                        break
+                if transcript:
+                    fetched = transcript.fetch()
+                    if hasattr(fetched, 'snippets'):
+                        transcript_data = [
+                            {'text': s.text} for s in fetched.snippets
+                        ]
+                    else:
+                        transcript_data = list(fetched)
+            except Exception as e:
+                logger.warning(f"list_transcripts failed: {e}")
+
+        # Old API (0.6.x): get_transcript
+        if not transcript_data and hasattr(YouTubeTranscriptApi, 'get_transcript'):
+            try:
+                transcript_data = YouTubeTranscriptApi.get_transcript(
+                    video_id, languages=['en', 'en-US', 'en-GB']
                 )
-            else:
-                text = str(fetched)
+            except Exception:
+                try:
+                    transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
+                except Exception as e:
+                    logger.warning(f"get_transcript failed: {e}")
+
+        # Even older API: fetch
+        if not transcript_data:
+            try:
+                fetched = YouTubeTranscriptApi.fetch(video_id)
+                if hasattr(fetched, 'snippets'):
+                    transcript_data = [{'text': s.text} for s in fetched.snippets]
+                else:
+                    transcript_data = list(fetched)
+            except Exception as e:
+                logger.warning(f"fetch failed: {e}")
+
+        if transcript_data:
+            text = ' '.join(
+                item.get('text', '') if isinstance(item, dict) else str(item)
+                for item in transcript_data
+            )
             if text.strip():
-                logger.info(f"Transcript API success for {video_id}")
+                logger.info(f"Transcript success for {video_id}")
                 return text.strip()
+
         return None
+
     except Exception as e:
-        logger.warning(f"Transcript API failed for {video_id}: {e}")
+        logger.warning(f"Transcript API error for {video_id}: {e}")
         return None
 
 
 def transcribe_with_groq(url):
-    """Download audio with yt-dlp and transcribe with Groq Whisper."""
+    """Download audio with yt-dlp + cookies and transcribe with Groq."""
     try:
         import yt_dlp
         from groq import Groq
@@ -72,6 +112,11 @@ def transcribe_with_groq(url):
             return None, None
 
         client = Groq(api_key=groq_key)
+
+        # Check if cookies file exists (uploaded to Render)
+        cookies_file = os.environ.get('YOUTUBE_COOKIES_FILE', '/etc/secrets/cookies.txt')
+        cookies_exist = os.path.exists(cookies_file)
+        logger.info(f"Cookies file exists: {cookies_exist} at {cookies_file}")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             ydl_opts = {
@@ -85,6 +130,12 @@ def transcribe_with_groq(url):
                 'quiet': True,
                 'no_warnings': True,
             }
+
+            # Add cookies if available
+            if cookies_exist:
+                ydl_opts['cookiefile'] = cookies_file
+                logger.info("Using cookies for yt-dlp")
+
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 title = info.get('title', 'Video')
@@ -96,16 +147,16 @@ def transcribe_with_groq(url):
                     break
 
             if not audio_file:
-                logger.error("No audio file found after yt-dlp")
+                logger.error("No audio file found")
                 return None, title
 
-            logger.info(f"Sending to Groq: {audio_file}")
             with open(audio_file, 'rb') as f:
                 transcription = client.audio.transcriptions.create(
                     file=(os.path.basename(audio_file), f.read()),
                     model='whisper-large-v3',
                     response_format='text'
                 )
+            logger.info(f"Groq transcription done: {title}")
             return str(transcription), title
 
     except Exception as e:
@@ -130,12 +181,11 @@ def transcribe():
             return jsonify({'error': 'url is required'}), 400
 
         logger.info(f"Transcribing: {url}")
-
         video_id = extract_video_id(url)
         if not video_id:
             return jsonify({'error': 'Invalid YouTube URL'}), 400
 
-        # Try transcript API first (fast, no download needed)
+        # Try transcript API first
         transcript = get_youtube_transcript(video_id)
         if transcript and len(transcript) > 20:
             return jsonify({
@@ -154,7 +204,10 @@ def transcribe():
                 'method': 'groq'
             })
 
-        return jsonify({'error': 'Could not transcribe this video'}), 422
+        return jsonify({
+            'error': 'Could not transcribe. Video has no captions and audio download was blocked. '
+                     'Try a video with auto-generated captions.'
+        }), 422
 
     except Exception as e:
         logger.error(f"Error: {e}")
