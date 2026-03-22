@@ -5,6 +5,7 @@ import re
 import tempfile
 import shutil
 import time
+import random
 
 logger = logging.getLogger(__name__)
 api_bp = Blueprint('api', __name__, url_prefix='/api')
@@ -23,16 +24,36 @@ def extract_video_id(url):
     return None
 
 
-def get_proxy():
-    return os.environ.get('WEBSHARE_PROXY', None)
+def get_proxies_list():
+    """
+    Returns list of proxy URLs.
+    Set WEBSHARE_PROXIES as comma-separated list in Render env:
+    http://user:pass@ip1:port1,http://user:pass@ip2:port2,...
+    Or just WEBSHARE_PROXY for a single proxy.
+    """
+    multi = os.environ.get('WEBSHARE_PROXIES', '')
+    if multi:
+        return [p.strip() for p in multi.split(',') if p.strip()]
+    single = os.environ.get('WEBSHARE_PROXY', '')
+    if single:
+        return [single]
+    return []
+
+
+def get_proxy_dict(proxy_url):
+    if not proxy_url:
+        return None
+    return {'http': proxy_url, 'https': proxy_url}
 
 
 def get_youtube_transcript(video_id):
     import requests
     import json
 
-    proxy_url = get_proxy()
-    proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
+    proxies_list = get_proxies_list()
+    if not proxies_list:
+        logger.warning("No proxies configured")
+        return None
 
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -41,9 +62,10 @@ def get_youtube_transcript(video_id):
     }
 
     try:
-        # Fetch YouTube watch page through proxy
+        # Use first proxy for page fetch
+        page_proxy = get_proxy_dict(proxies_list[0])
         page_url = f'https://www.youtube.com/watch?v={video_id}'
-        resp = requests.get(page_url, headers=headers, proxies=proxies, timeout=20)
+        resp = requests.get(page_url, headers=headers, proxies=page_proxy, timeout=20)
         if not resp.ok:
             logger.warning(f"Page fetch failed: {resp.status_code}")
             return None
@@ -57,7 +79,6 @@ def get_youtube_transcript(video_id):
         caption_tracks = json.loads(match.group(1))
         logger.info(f"Found {len(caption_tracks)} caption tracks")
 
-        # Pick best track — English first, then any
         caption_url = None
         for track in caption_tracks:
             lang = track.get('languageCode', '')
@@ -67,27 +88,26 @@ def get_youtube_transcript(video_id):
                 break
         if not caption_url and caption_tracks:
             caption_url = caption_tracks[0].get('baseUrl')
-            logger.info(f"Using first caption: {caption_tracks[0].get('languageCode')}")
 
         if not caption_url:
             return None
 
-        # Fetch caption with proxy + retry on 429
-        for attempt in range(3):
+        # Try each proxy for the caption fetch
+        random.shuffle(proxies_list)
+        for proxy_url in proxies_list:
+            proxy = get_proxy_dict(proxy_url)
             try:
                 cap_resp = requests.get(
                     caption_url + '&fmt=json3',
                     headers=headers,
-                    proxies=proxies,
+                    proxies=proxy,
                     timeout=20
                 )
+                logger.info(f"Caption fetch status: {cap_resp.status_code} via {proxy_url.split('@')[-1]}")
                 if cap_resp.status_code == 429:
-                    logger.warning(f"Caption 429, waiting 2s (attempt {attempt+1})")
-                    time.sleep(2)
-                    continue
+                    continue  # try next proxy
                 if not cap_resp.ok:
-                    logger.warning(f"Caption fetch failed: {cap_resp.status_code}")
-                    return None
+                    continue
 
                 data = cap_resp.json()
                 events = data.get('events', [])
@@ -100,13 +120,14 @@ def get_youtube_transcript(video_id):
 
                 text = ' '.join(texts).strip()
                 if text:
-                    logger.info(f"Transcript success for {video_id}, chars={len(text)}")
+                    logger.info(f"Transcript success, chars={len(text)}")
                     return text
-                break
-            except Exception as e:
-                logger.warning(f"Caption attempt {attempt+1} failed: {e}")
-                time.sleep(1)
 
+            except Exception as e:
+                logger.warning(f"Proxy {proxy_url.split('@')[-1]} failed: {e}")
+                continue
+
+        logger.warning("All proxies returned 429 for caption")
         return None
 
     except Exception as e:
@@ -138,8 +159,8 @@ def transcribe_with_groq(url):
 
         client = Groq(api_key=groq_key)
         cookies_path = get_cookies_path()
-        proxy_url = get_proxy()
-        proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
+        proxies_list = get_proxies_list()
+        proxy_url = proxies_list[0] if proxies_list else None
 
         ydl_opts = {
             'format': 'bestaudio/best',
@@ -158,50 +179,62 @@ def transcribe_with_groq(url):
         audio_url = None
         title = 'Video'
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            title = info.get('title', 'Video')
-            formats = info.get('formats', [])
-            # Pick best audio format
-            for f in reversed(formats):
-                if f.get('acodec') not in (None, 'none') and f.get('url'):
-                    audio_url = f['url']
-                    logger.info(f"Audio format: {f.get('ext')} {f.get('abr')}kbps")
-                    break
-            if not audio_url:
-                audio_url = info.get('url')
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                title = info.get('title', 'Video')
+                formats = info.get('formats', [])
+                for f in reversed(formats):
+                    if f.get('acodec') not in (None, 'none') and f.get('url'):
+                        audio_url = f['url']
+                        break
+                if not audio_url:
+                    audio_url = info.get('url')
+        except Exception as e:
+            logger.warning(f"yt-dlp info failed: {e}")
 
         if not audio_url:
-            logger.error("No audio URL from yt-dlp")
             return None, title
 
-        # Download audio via requests with proxy
-        logger.info("Downloading audio via requests...")
+        # Try each proxy for audio download
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'User-Agent': 'Mozilla/5.0',
             'Referer': 'https://www.youtube.com/',
         }
-        audio_resp = requests.get(audio_url, headers=headers, proxies=proxies, timeout=120, stream=True)
-        if not audio_resp.ok:
-            logger.error(f"Audio download failed: {audio_resp.status_code}")
-            return None, title
 
-        with tempfile.NamedTemporaryFile(suffix='.m4a', delete=False) as tmp_f:
-            tmp_path = tmp_f.name
-            for chunk in audio_resp.iter_content(chunk_size=32768):
-                tmp_f.write(chunk)
+        for p_url in (proxies_list if proxies_list else [None]):
+            proxies = get_proxy_dict(p_url)
+            try:
+                audio_resp = requests.get(
+                    audio_url, headers=headers,
+                    proxies=proxies, timeout=120, stream=True
+                )
+                if not audio_resp.ok:
+                    logger.warning(f"Audio download {audio_resp.status_code}")
+                    continue
 
-        size = os.path.getsize(tmp_path)
-        logger.info(f"Audio downloaded: {size} bytes, sending to Groq...")
+                with tempfile.NamedTemporaryFile(suffix='.m4a', delete=False) as tmp_f:
+                    tmp_path = tmp_f.name
+                    for chunk in audio_resp.iter_content(chunk_size=32768):
+                        tmp_f.write(chunk)
 
-        with open(tmp_path, 'rb') as f:
-            transcription = client.audio.transcriptions.create(
-                file=('audio.m4a', f.read()),
-                model='whisper-large-v3',
-                response_format='text'
-            )
-        os.unlink(tmp_path)
-        return str(transcription), title
+                size = os.path.getsize(tmp_path)
+                logger.info(f"Audio: {size} bytes → Groq")
+
+                with open(tmp_path, 'rb') as f:
+                    transcription = client.audio.transcriptions.create(
+                        file=('audio.m4a', f.read()),
+                        model='whisper-large-v3',
+                        response_format='text'
+                    )
+                os.unlink(tmp_path)
+                return str(transcription), title
+
+            except Exception as e:
+                logger.warning(f"Audio attempt failed: {e}")
+                continue
+
+        return None, title
 
     except Exception as e:
         logger.error(f"Groq failed: {e}")
@@ -210,10 +243,11 @@ def transcribe_with_groq(url):
 
 @api_bp.route('/health', methods=['GET'])
 def health():
+    proxies = get_proxies_list()
     return jsonify({
         'status': 'ok',
         'service': 'WhisperTube',
-        'proxy_set': bool(get_proxy()),
+        'proxy_count': len(proxies),
         'cookies': os.path.exists('/etc/secrets/cookies.txt'),
         'groq': bool(os.environ.get('GROQ_API_KEY'))
     })
