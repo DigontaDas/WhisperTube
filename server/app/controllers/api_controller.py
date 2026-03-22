@@ -4,6 +4,7 @@ import os
 import re
 import tempfile
 import shutil
+import requests
 
 logger = logging.getLogger(__name__)
 api_bp = Blueprint('api', __name__, url_prefix='/api')
@@ -23,74 +24,63 @@ def extract_video_id(url):
 
 
 def get_proxy():
-    """Get proxy URL from environment variable."""
     return os.environ.get('WEBSHARE_PROXY', None)
 
 
 def get_youtube_transcript(video_id):
-    """Fetch transcript using proxy to bypass cloud IP ban."""
+    """Use requests with proxy to fetch transcript directly."""
+    proxy_url = get_proxy()
+    proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
+
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        from youtube_transcript_api.proxies import WebshareProxyConfig
 
-        proxy_url = get_proxy()
-
-        if proxy_url:
-            logger.info(f"Using proxy for transcript API")
-            # New 1.x API with proxy support
-            proxy_config = WebshareProxyConfig(
-                proxy_username=None,  # parsed from URL
-                proxy_password=None,
-            )
-            # Parse proxy URL: http://user:pass@host:port
-            import urllib.parse
-            parsed = urllib.parse.urlparse(proxy_url)
-            ytt_api = YouTubeTranscriptApi(
-                proxies={
-                    'http': proxy_url,
-                    'https': proxy_url,
-                }
-            )
+        # Pass a custom requests session with proxy
+        if proxies:
+            session = requests.Session()
+            session.proxies.update(proxies)
+            ytt_api = YouTubeTranscriptApi(http_client=session)
         else:
-            logger.warning("No proxy configured — transcript may fail on cloud IP")
             ytt_api = YouTubeTranscriptApi()
 
-        # Try fetch
+        fetched = ytt_api.fetch(video_id)
+        text = ' '.join(s.text for s in fetched.snippets)
+        if text.strip():
+            logger.info(f"Transcript success, chars={len(text)}")
+            return text.strip()
+        return None
+
+    except TypeError:
+        # http_client not supported — try monkey-patching requests
+        logger.warning("http_client not supported, trying requests patch")
         try:
+            from youtube_transcript_api import YouTubeTranscriptApi
+            import youtube_transcript_api._transcripts as _t
+
+            if proxies:
+                orig_get = requests.get
+                def patched_get(url, **kwargs):
+                    kwargs.setdefault('proxies', proxies)
+                    return orig_get(url, **kwargs)
+                _t.requests.get = patched_get
+
+            ytt_api = YouTubeTranscriptApi()
             fetched = ytt_api.fetch(video_id)
             text = ' '.join(s.text for s in fetched.snippets)
+
+            if proxies:
+                _t.requests.get = orig_get  # restore
+
             if text.strip():
-                logger.info(f"Transcript success for {video_id}, chars={len(text)}")
+                logger.info(f"Transcript success via patch, chars={len(text)}")
                 return text.strip()
-        except Exception as e:
-            logger.warning(f"fetch() failed: {str(e)[:100]}")
-
-        # Try list then fetch
-        try:
-            for t in ytt_api.list(video_id):
-                try:
-                    fetched = t.fetch()
-                    if hasattr(fetched, 'snippets'):
-                        text = ' '.join(s.text for s in fetched.snippets)
-                    else:
-                        text = ' '.join(
-                            item.get('text', '') if isinstance(item, dict)
-                            else getattr(item, 'text', str(item))
-                            for item in fetched
-                        )
-                    if text.strip():
-                        logger.info(f"Transcript via list, lang={t.language_code}")
-                        return text.strip()
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.warning(f"list() failed: {str(e)[:100]}")
-
-        return None
+        except Exception as e2:
+            logger.warning(f"Patched transcript failed: {e2}")
 
     except Exception as e:
-        logger.error(f"Transcript API error: {e}")
-        return None
+        logger.warning(f"Transcript failed: {str(e)[:200]}")
+
+    return None
 
 
 def get_cookies_path():
@@ -122,7 +112,8 @@ def transcribe_with_groq(url):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             ydl_opts = {
-                'format': 'bestaudio/best',
+                # Most permissive format — accept anything with audio
+                'format': 'bestaudio/best/worstaudio',
                 'outtmpl': os.path.join(tmpdir, 'audio.%(ext)s'),
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
@@ -131,8 +122,12 @@ def transcribe_with_groq(url):
                 }],
                 'quiet': True,
                 'no_warnings': True,
+                # Try multiple clients
                 'extractor_args': {
-                    'youtube': {'player_client': ['android', 'web']}
+                    'youtube': {
+                        'player_client': ['ios', 'android', 'web'],
+                        'player_skip': ['webpage'],
+                    }
                 },
             }
             if cookies_path:
@@ -152,6 +147,7 @@ def transcribe_with_groq(url):
                     break
 
             if not audio_file:
+                logger.error("No audio file found")
                 return None, title
 
             with open(audio_file, 'rb') as f:
@@ -208,7 +204,7 @@ def transcribe():
         if transcript:
             return jsonify({'transcript': transcript, 'title': title or video_id, 'method': 'groq'})
 
-        return jsonify({'error': 'Could not transcribe. Make sure WEBSHARE_PROXY is set in Render environment.'}), 422
+        return jsonify({'error': 'Could not transcribe this video'}), 422
 
     except Exception as e:
         logger.error(f"Error: {e}")
