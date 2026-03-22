@@ -22,41 +22,52 @@ def extract_video_id(url):
     return None
 
 
+def get_proxy():
+    """Get proxy URL from environment variable."""
+    return os.environ.get('WEBSHARE_PROXY', None)
+
+
 def get_youtube_transcript(video_id):
-    """
-    youtube-transcript-api 1.x (latest):
-    MUST use instance: ytt_api = YouTubeTranscriptApi()
-    then ytt_api.fetch(video_id) or ytt_api.list(video_id)
-    """
+    """Fetch transcript using proxy to bypass cloud IP ban."""
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
+        from youtube_transcript_api.proxies import WebshareProxyConfig
 
-        ytt_api = YouTubeTranscriptApi()
+        proxy_url = get_proxy()
 
-        # Simple fetch — tries English by default
+        if proxy_url:
+            logger.info(f"Using proxy for transcript API")
+            # New 1.x API with proxy support
+            proxy_config = WebshareProxyConfig(
+                proxy_username=None,  # parsed from URL
+                proxy_password=None,
+            )
+            # Parse proxy URL: http://user:pass@host:port
+            import urllib.parse
+            parsed = urllib.parse.urlparse(proxy_url)
+            ytt_api = YouTubeTranscriptApi(
+                proxies={
+                    'http': proxy_url,
+                    'https': proxy_url,
+                }
+            )
+        else:
+            logger.warning("No proxy configured — transcript may fail on cloud IP")
+            ytt_api = YouTubeTranscriptApi()
+
+        # Try fetch
         try:
             fetched = ytt_api.fetch(video_id)
             text = ' '.join(s.text for s in fetched.snippets)
             if text.strip():
-                logger.info(f"fetch() success for {video_id}, chars={len(text)}")
+                logger.info(f"Transcript success for {video_id}, chars={len(text)}")
                 return text.strip()
         except Exception as e:
-            logger.warning(f"fetch() failed: {e}")
+            logger.warning(f"fetch() failed: {str(e)[:100]}")
 
-        # Try fetch with explicit languages
+        # Try list then fetch
         try:
-            fetched = ytt_api.fetch(video_id, languages=['en', 'en-US', 'en-GB'])
-            text = ' '.join(s.text for s in fetched.snippets)
-            if text.strip():
-                logger.info(f"fetch(en) success for {video_id}")
-                return text.strip()
-        except Exception as e:
-            logger.warning(f"fetch(en) failed: {e}")
-
-        # Try list then fetch first available
-        try:
-            transcript_list = ytt_api.list(video_id)
-            for t in transcript_list:
+            for t in ytt_api.list(video_id):
                 try:
                     fetched = t.fetch()
                     if hasattr(fetched, 'snippets'):
@@ -68,12 +79,12 @@ def get_youtube_transcript(video_id):
                             for item in fetched
                         )
                     if text.strip():
-                        logger.info(f"list+fetch success lang={t.language_code}")
+                        logger.info(f"Transcript via list, lang={t.language_code}")
                         return text.strip()
                 except Exception:
                     continue
         except Exception as e:
-            logger.warning(f"list() failed: {e}")
+            logger.warning(f"list() failed: {str(e)[:100]}")
 
         return None
 
@@ -107,6 +118,7 @@ def transcribe_with_groq(url):
 
         client = Groq(api_key=groq_key)
         cookies_path = get_cookies_path()
+        proxy_url = get_proxy()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             ydl_opts = {
@@ -125,6 +137,9 @@ def transcribe_with_groq(url):
             }
             if cookies_path:
                 ydl_opts['cookiefile'] = cookies_path
+            if proxy_url:
+                ydl_opts['proxy'] = proxy_url
+                logger.info("Using proxy for yt-dlp")
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -163,6 +178,7 @@ def health():
         'status': 'ok',
         'service': 'WhisperTube',
         'yta_version': ver,
+        'proxy_set': bool(get_proxy()),
         'cookies': os.path.exists('/etc/secrets/cookies.txt'),
         'groq': bool(os.environ.get('GROQ_API_KEY'))
     })
@@ -184,17 +200,15 @@ def transcribe():
         if not video_id:
             return jsonify({'error': 'Invalid YouTube URL'}), 400
 
-        # Method 1: transcript API (instant, no download)
         transcript = get_youtube_transcript(video_id)
         if transcript and len(transcript) > 20:
             return jsonify({'transcript': transcript, 'title': video_id, 'method': 'transcript_api'})
 
-        # Method 2: yt-dlp + Groq
         transcript, title = transcribe_with_groq(url)
         if transcript:
             return jsonify({'transcript': transcript, 'title': title or video_id, 'method': 'groq'})
 
-        return jsonify({'error': 'Could not transcribe this video'}), 422
+        return jsonify({'error': 'Could not transcribe. Make sure WEBSHARE_PROXY is set in Render environment.'}), 422
 
     except Exception as e:
         logger.error(f"Error: {e}")
