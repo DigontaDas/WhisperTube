@@ -4,7 +4,6 @@ import os
 import re
 import tempfile
 import shutil
-import time
 import random
 
 logger = logging.getLogger(__name__)
@@ -25,12 +24,6 @@ def extract_video_id(url):
 
 
 def get_proxies_list():
-    """
-    Returns list of proxy URLs.
-    Set WEBSHARE_PROXIES as comma-separated list in Render env:
-    http://user:pass@ip1:port1,http://user:pass@ip2:port2,...
-    Or just WEBSHARE_PROXY for a single proxy.
-    """
     multi = os.environ.get('WEBSHARE_PROXIES', '')
     if multi:
         return [p.strip() for p in multi.split(',') if p.strip()]
@@ -40,13 +33,11 @@ def get_proxies_list():
     return []
 
 
-def get_proxy_dict(proxy_url):
-    if not proxy_url:
-        return None
-    return {'http': proxy_url, 'https': proxy_url}
-
-
 def get_youtube_transcript(video_id):
+    """
+    Fetch page AND caption using the SAME session/proxy in one go.
+    The caption URL token is tied to the session that fetched the page.
+    """
     import requests
     import json
 
@@ -55,84 +46,85 @@ def get_youtube_transcript(video_id):
         logger.warning("No proxies configured")
         return None
 
+    random.shuffle(proxies_list)
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Connection': 'keep-alive',
     }
 
-    try:
-        # Use first proxy for page fetch
-        page_proxy = get_proxy_dict(proxies_list[0])
-        page_url = f'https://www.youtube.com/watch?v={video_id}'
-        resp = requests.get(page_url, headers=headers, proxies=page_proxy, timeout=20)
-        if not resp.ok:
-            logger.warning(f"Page fetch failed: {resp.status_code}")
-            return None
+    for proxy_url in proxies_list:
+        proxies = {'http': proxy_url, 'https': proxy_url}
+        try:
+            # Use a persistent session — same cookies, same IP for both requests
+            session = requests.Session()
+            session.proxies.update(proxies)
+            session.headers.update(headers)
 
-        html = resp.text
-        match = re.search(r'"captionTracks":\s*(\[.*?\])', html)
-        if not match:
-            logger.warning(f"No captionTracks for {video_id}")
-            return None
-
-        caption_tracks = json.loads(match.group(1))
-        logger.info(f"Found {len(caption_tracks)} caption tracks")
-
-        caption_url = None
-        for track in caption_tracks:
-            lang = track.get('languageCode', '')
-            if lang.startswith('en'):
-                caption_url = track.get('baseUrl')
-                logger.info(f"Using EN caption: {lang}")
-                break
-        if not caption_url and caption_tracks:
-            caption_url = caption_tracks[0].get('baseUrl')
-
-        if not caption_url:
-            return None
-
-        # Try each proxy for the caption fetch
-        random.shuffle(proxies_list)
-        for proxy_url in proxies_list:
-            proxy = get_proxy_dict(proxy_url)
-            try:
-                cap_resp = requests.get(
-                    caption_url + '&fmt=json3',
-                    headers=headers,
-                    proxies=proxy,
-                    timeout=20
-                )
-                logger.info(f"Caption fetch status: {cap_resp.status_code} via {proxy_url.split('@')[-1]}")
-                if cap_resp.status_code == 429:
-                    continue  # try next proxy
-                if not cap_resp.ok:
-                    continue
-
-                data = cap_resp.json()
-                events = data.get('events', [])
-                texts = []
-                for event in events:
-                    for seg in event.get('segs', []):
-                        t = seg.get('utf8', '').strip()
-                        if t and t != '\n':
-                            texts.append(t)
-
-                text = ' '.join(texts).strip()
-                if text:
-                    logger.info(f"Transcript success, chars={len(text)}")
-                    return text
-
-            except Exception as e:
-                logger.warning(f"Proxy {proxy_url.split('@')[-1]} failed: {e}")
+            # Step 1: Fetch page
+            page_url = f'https://www.youtube.com/watch?v={video_id}'
+            resp = session.get(page_url, timeout=20)
+            if not resp.ok:
+                logger.warning(f"Page {resp.status_code} via {proxy_url.split('@')[-1]}")
                 continue
 
-        logger.warning("All proxies returned 429 for caption")
-        return None
+            html = resp.text
+            match = re.search(r'"captionTracks":\s*(\[.*?\])', html)
+            if not match:
+                logger.warning(f"No captions for {video_id}")
+                return None  # Video has no captions at all
 
-    except Exception as e:
-        logger.warning(f"Transcript failed: {e}")
-        return None
+            caption_tracks = json.loads(match.group(1))
+            logger.info(f"Found {len(caption_tracks)} caption tracks via {proxy_url.split('@')[-1]}")
+
+            # Pick English track
+            caption_url = None
+            for track in caption_tracks:
+                lang = track.get('languageCode', '')
+                if lang.startswith('en'):
+                    caption_url = track.get('baseUrl')
+                    logger.info(f"Using EN: {lang}")
+                    break
+            if not caption_url and caption_tracks:
+                caption_url = caption_tracks[0].get('baseUrl')
+                logger.info(f"Using: {caption_tracks[0].get('languageCode')}")
+
+            if not caption_url:
+                return None
+
+            # Step 2: Fetch caption WITH SAME SESSION (same cookies + proxy)
+            cap_resp = session.get(caption_url + '&fmt=json3', timeout=20)
+            logger.info(f"Caption status: {cap_resp.status_code}")
+
+            if cap_resp.status_code == 429:
+                logger.warning(f"Caption 429, trying next proxy")
+                continue
+
+            if not cap_resp.ok:
+                logger.warning(f"Caption failed: {cap_resp.status_code}")
+                continue
+
+            data = cap_resp.json()
+            events = data.get('events', [])
+            texts = []
+            for event in events:
+                for seg in event.get('segs', []):
+                    t = seg.get('utf8', '').strip()
+                    if t and t != '\n':
+                        texts.append(t)
+
+            text = ' '.join(texts).strip()
+            if text:
+                logger.info(f"Transcript success! chars={len(text)}")
+                return text
+
+        except Exception as e:
+            logger.warning(f"Proxy {proxy_url.split('@')[-1]} error: {e}")
+            continue
+
+    logger.error("All proxies failed for transcript")
+    return None
 
 
 def get_cookies_path():
@@ -191,50 +183,35 @@ def transcribe_with_groq(url):
                 if not audio_url:
                     audio_url = info.get('url')
         except Exception as e:
-            logger.warning(f"yt-dlp info failed: {e}")
+            logger.warning(f"yt-dlp failed: {e}")
 
         if not audio_url:
             return None, title
 
-        # Try each proxy for audio download
-        headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'Referer': 'https://www.youtube.com/',
-        }
+        headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.youtube.com/'}
+        proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
 
-        for p_url in (proxies_list if proxies_list else [None]):
-            proxies = get_proxy_dict(p_url)
-            try:
-                audio_resp = requests.get(
-                    audio_url, headers=headers,
-                    proxies=proxies, timeout=120, stream=True
-                )
-                if not audio_resp.ok:
-                    logger.warning(f"Audio download {audio_resp.status_code}")
-                    continue
+        audio_resp = requests.get(audio_url, headers=headers, proxies=proxies, timeout=120, stream=True)
+        if not audio_resp.ok:
+            logger.error(f"Audio download failed: {audio_resp.status_code}")
+            return None, title
 
-                with tempfile.NamedTemporaryFile(suffix='.m4a', delete=False) as tmp_f:
-                    tmp_path = tmp_f.name
-                    for chunk in audio_resp.iter_content(chunk_size=32768):
-                        tmp_f.write(chunk)
+        with tempfile.NamedTemporaryFile(suffix='.m4a', delete=False) as tmp_f:
+            tmp_path = tmp_f.name
+            for chunk in audio_resp.iter_content(chunk_size=32768):
+                tmp_f.write(chunk)
 
-                size = os.path.getsize(tmp_path)
-                logger.info(f"Audio: {size} bytes → Groq")
+        size = os.path.getsize(tmp_path)
+        logger.info(f"Audio {size} bytes → Groq")
 
-                with open(tmp_path, 'rb') as f:
-                    transcription = client.audio.transcriptions.create(
-                        file=('audio.m4a', f.read()),
-                        model='whisper-large-v3',
-                        response_format='text'
-                    )
-                os.unlink(tmp_path)
-                return str(transcription), title
-
-            except Exception as e:
-                logger.warning(f"Audio attempt failed: {e}")
-                continue
-
-        return None, title
+        with open(tmp_path, 'rb') as f:
+            transcription = client.audio.transcriptions.create(
+                file=('audio.m4a', f.read()),
+                model='whisper-large-v3',
+                response_format='text'
+            )
+        os.unlink(tmp_path)
+        return str(transcription), title
 
     except Exception as e:
         logger.error(f"Groq failed: {e}")
