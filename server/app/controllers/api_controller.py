@@ -4,6 +4,7 @@ import os
 import re
 import tempfile
 import shutil
+import random
 
 logger = logging.getLogger(__name__)
 api_bp = Blueprint('api', __name__, url_prefix='/api')
@@ -22,79 +23,97 @@ def extract_video_id(url):
     return None
 
 
-def get_proxy():
-    """Single proxy URL from WEBSHARE_PROXY env var."""
-    return os.environ.get('WEBSHARE_PROXY', '').strip()
+def get_proxies_list():
+    # Try multi first, then single
+    multi = os.environ.get('WEBSHARE_PROXIES', '').strip()
+    if multi:
+        return [p.strip() for p in multi.split(',') if p.strip()]
+    single = os.environ.get('WEBSHARE_PROXY', '').strip()
+    if single:
+        return [single]
+    return []
 
 
 def get_youtube_transcript(video_id):
     import requests
     import json
 
-    proxy_url = get_proxy()
-    if not proxy_url:
-        logger.warning("No proxy set")
-        return None
+    proxies_list = get_proxies_list()
+    logger.info(f"Trying transcript with {len(proxies_list)} proxies")
 
-    proxies = {'http': proxy_url, 'https': proxy_url}
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     }
 
-    try:
-        # Use ONE session for both page + caption — same cookies, same IP
-        session = requests.Session()
-        session.proxies.update(proxies)
-        session.headers.update(headers)
+    # Shuffle so we don't always hammer the same proxy
+    random.shuffle(proxies_list)
 
-        page_resp = session.get(
-            f'https://www.youtube.com/watch?v={video_id}',
-            timeout=20
-        )
-        logger.info(f"Page status: {page_resp.status_code}")
-        if not page_resp.ok:
-            return None
+    for proxy_url in proxies_list:
+        proxies = {'http': proxy_url, 'https': proxy_url}
+        label = proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url
+        try:
+            session = requests.Session()
+            session.proxies.update(proxies)
+            session.headers.update(headers)
 
-        match = re.search(r'"captionTracks":\s*(\[.*?\])', page_resp.text)
-        if not match:
-            logger.warning(f"No captions for {video_id}")
-            return None
+            page_resp = session.get(
+                f'https://www.youtube.com/watch?v={video_id}',
+                timeout=20
+            )
+            logger.info(f"Page {page_resp.status_code} via {label}")
 
-        tracks = json.loads(match.group(1))
-        logger.info(f"Found {len(tracks)} caption tracks")
+            if page_resp.status_code == 429:
+                logger.warning(f"Page 429 on {label}, trying next proxy")
+                continue
+            if not page_resp.ok:
+                continue
 
-        caption_url = None
-        for t in tracks:
-            if t.get('languageCode', '').startswith('en'):
-                caption_url = t.get('baseUrl')
-                break
-        if not caption_url:
-            caption_url = tracks[0].get('baseUrl') if tracks else None
-        if not caption_url:
-            return None
+            match = re.search(r'"captionTracks":\s*(\[.*?\])', page_resp.text)
+            if not match:
+                logger.warning(f"No captions for {video_id}")
+                return None  # No captions — don't try other proxies
 
-        cap_resp = session.get(caption_url + '&fmt=json3', timeout=20)
-        logger.info(f"Caption status: {cap_resp.status_code}")
-        if not cap_resp.ok:
-            return None
+            tracks = json.loads(match.group(1))
+            logger.info(f"Found {len(tracks)} tracks")
 
-        events = cap_resp.json().get('events', [])
-        texts = [
-            seg.get('utf8', '').strip()
-            for event in events
-            for seg in event.get('segs', [])
-            if seg.get('utf8', '').strip() not in ('', '\n')
-        ]
-        text = ' '.join(texts).strip()
-        if text:
-            logger.info(f"Transcript success! chars={len(text)}")
-            return text
-        return None
+            caption_url = None
+            for t in tracks:
+                if t.get('languageCode', '').startswith('en'):
+                    caption_url = t.get('baseUrl')
+                    break
+            if not caption_url and tracks:
+                caption_url = tracks[0].get('baseUrl')
+            if not caption_url:
+                return None
 
-    except Exception as e:
-        logger.error(f"Transcript error: {e}")
-        return None
+            cap_resp = session.get(caption_url + '&fmt=json3', timeout=20)
+            logger.info(f"Caption {cap_resp.status_code} via {label}")
+
+            if cap_resp.status_code == 429:
+                continue
+            if not cap_resp.ok:
+                continue
+
+            events = cap_resp.json().get('events', [])
+            texts = [
+                seg.get('utf8', '').strip()
+                for event in events
+                for seg in event.get('segs', [])
+                if seg.get('utf8', '').strip() not in ('', '\n')
+            ]
+            text = ' '.join(texts).strip()
+            if text:
+                logger.info(f"Transcript success! chars={len(text)}")
+                return text
+
+        except Exception as e:
+            logger.warning(f"Proxy {label} error: {e}")
+            continue
+
+    logger.error("All proxies failed — consider upgrading to residential proxies")
+    return None
 
 
 def get_cookies_path():
@@ -121,44 +140,56 @@ def transcribe_with_groq(url):
 
         client = Groq(api_key=groq_key)
         cookies_path = get_cookies_path()
-        proxy_url = get_proxy()
-        proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
-
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'skip_download': True,
-            'extractor_args': {'youtube': {'player_client': ['ios', 'android']}},
-        }
-        if cookies_path:
-            ydl_opts['cookiefile'] = cookies_path
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+        proxies_list = get_proxies_list()
 
         audio_url = None
         title = 'Video'
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                title = info.get('title', 'Video')
-                for f in reversed(info.get('formats', [])):
-                    if f.get('acodec') not in (None, 'none') and f.get('url'):
-                        audio_url = f['url']
-                        break
-                if not audio_url:
-                    audio_url = info.get('url')
-        except Exception as e:
-            logger.warning(f"yt-dlp failed: {e}")
+
+        # Try each proxy for yt-dlp info
+        for proxy_url in proxies_list:
+            try:
+                ydl_opts = {
+                    'format': 'bestaudio/best',
+                    'quiet': True,
+                    'no_warnings': True,
+                    'skip_download': True,
+                    'extractor_args': {
+                        'youtube': {'player_client': ['web']}  # web supports cookies
+                    },
+                }
+                if cookies_path:
+                    ydl_opts['cookiefile'] = cookies_path
+                if proxy_url:
+                    ydl_opts['proxy'] = proxy_url
+
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    title = info.get('title', 'Video')
+                    for f in reversed(info.get('formats', [])):
+                        if f.get('acodec') not in (None, 'none') and f.get('url'):
+                            audio_url = f['url']
+                            break
+                    if not audio_url:
+                        audio_url = info.get('url')
+
+                if audio_url:
+                    logger.info(f"Got audio URL via {proxy_url.split('@')[-1]}")
+                    break
+            except Exception as e:
+                logger.warning(f"yt-dlp failed on {proxy_url.split('@')[-1]}: {str(e)[:80]}")
+                continue
 
         if not audio_url:
             return None, title
 
-        audio_resp = requests.get(
-            audio_url,
-            headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.youtube.com/'},
-            proxies=proxies, timeout=120, stream=True
-        )
+        # Download audio
+        proxy_url = proxies_list[0] if proxies_list else None
+        proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
+        headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.youtube.com/'}
+
+        audio_resp = requests.get(audio_url, headers=headers, proxies=proxies, timeout=120, stream=True)
         if not audio_resp.ok:
+            logger.error(f"Audio download {audio_resp.status_code}")
             return None, title
 
         with tempfile.NamedTemporaryFile(suffix='.m4a', delete=False) as f:
@@ -166,7 +197,9 @@ def transcribe_with_groq(url):
             for chunk in audio_resp.iter_content(32768):
                 f.write(chunk)
 
-        logger.info(f"Audio {os.path.getsize(tmp_path)} bytes → Groq")
+        size = os.path.getsize(tmp_path)
+        logger.info(f"Audio {size} bytes → Groq")
+
         with open(tmp_path, 'rb') as f:
             result = client.audio.transcriptions.create(
                 file=('audio.m4a', f.read()),
@@ -183,11 +216,12 @@ def transcribe_with_groq(url):
 
 @api_bp.route('/health', methods=['GET'])
 def health():
-    proxy = get_proxy()
+    proxies = get_proxies_list()
     return jsonify({
         'status': 'ok',
         'service': 'WhisperTube',
-        'proxy': proxy.split('@')[-1] if proxy else 'not set',
+        'proxy_count': len(proxies),
+        'proxies': [p.split('@')[-1] for p in proxies],
         'cookies': os.path.exists('/etc/secrets/cookies.txt'),
         'groq': bool(os.environ.get('GROQ_API_KEY'))
     })
